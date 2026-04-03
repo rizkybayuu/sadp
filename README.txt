@@ -29,7 +29,7 @@ REQUIREMENTS
 INSTALLATION
 ------------
 One-liner (recommended):
-  sudo curl -o /usr/local/sbin/sadp https://raw.githubusercontent.com/rizkybayuu_/sadp/main/sadp && sudo chmod +x /usr/local/sbin/sadp
+  sudo curl -o /usr/local/sbin/sadp https://raw.githubusercontent.com/rizkybayuu/sadp/main/sadp && sudo chmod +x /usr/local/sbin/sadp
 
 Manual:
   1. Download the script and place it in /usr/local/sbin/
