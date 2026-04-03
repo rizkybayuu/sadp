@@ -96,6 +96,7 @@ Special thanks to the AI assistants that helped refine, test, and polish this pr
   - Gemini (Google)
   - Qwen (Alibaba)
   - Copilot (GitHub / OpenAI)
+  - Claude
 
 Their insights and suggestions contributed significantly to the security,
 robustness, and usability of sadp.
