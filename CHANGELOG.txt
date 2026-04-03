@@ -1,0 +1,33 @@
+sadp Changelog
+
+[1.0] - 2026-04-02
+------------------
+ADDED:
+  - Initial stable release
+  - Support for 12+ native package managers
+  - Smart fallback to Flatpak with interactive candidate selection
+  - Confirmation prompt for removal (prevents accidental deletions)
+  - Atomic log rotation with file locking
+  - --dry-run and --yes options for automation
+  - I/O throttling (ionice/nice) for cleanup operations only
+
+SECURITY:
+  - PATH hardening at script startup
+  - Instance locking via flock (prevents race conditions)
+  - Input sanitization for package names (2-layer validation)
+  - No eval, no sudo -E (minimized attack surface)
+  - Separate file descriptors for instance and log locks
+  - Non-interactive safe prompts ([ -t 0 ] detection)
+
+FIXED:
+  - TOCTOU race condition in log rotation
+  - Missing removal confirmation prompt in do_remove
+  - Hardcoded user paths replaced with dynamic variables
+  - Word-splitting vulnerabilities in command arrays
+  - Flatpak detection now checks both system and user installations
+  - Flatpak installation uses --user context to avoid root ownership
+  - Limited Flatpak candidate display to 20 entries
+
+IMPROVED:
+  - XBPS verification using xbps-query -p for reliability
+  - Diagnostic logging for package verification failures

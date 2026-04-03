@@ -1,0 +1,596 @@
+#!/bin/bash
+# ====================================================================
+# sadp - Sadaptive Package Manager v1.0 (The Ironclad Release)
+# ====================================================================
+# Universal package manager wrapper with safety, interactive mode,
+# I/O throttling only for cleanup, and flatpak user detection.
+# Maintainer: rizkybayuu_
+# License: MIT
+# ====================================================================
+
+# --- PATH HARDENING ---
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# --- COLORS ---
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'
+CYAN='\033[36m'; BOLD='\033[1m'; RESET='\033[0m'
+LINE='────────────────────────────────────────────────────────────'
+
+# --- CONFIGURATION ---
+DRY_RUN=0
+AUTO_YES=0
+LOG_DIR="/var/log/sadp"
+LOG_FILE="$LOG_DIR/install.log"
+LOG_LOCK_FILE="$LOG_DIR/.log.lock"
+LOCK_FILE="/var/run/sadp.lock"
+
+# I/O priority as arrays (safe) – hanya digunakan untuk mode cleanup
+if command -v ionice >/dev/null 2>&1; then
+    IONICE_CMD=(ionice -c 3)
+else
+    IONICE_CMD=()
+fi
+NICE_CMD=(nice -n 19)
+
+# --- SUDO ESCALATION (tanpa -E) ---
+if [ "$EUID" -ne 0 ]; then
+    printf "${YELLOW}[!] Sadaptive requires root. Escalating...${RESET}\n"
+    exec sudo "$0" "$@"
+fi
+
+# --- LOCKING (instance) ---
+mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
+touch "$LOCK_FILE"
+chown root:root "$LOCK_FILE" 2>/dev/null || true
+chmod 0600 "$LOCK_FILE" 2>/dev/null || true
+exec 200>"$LOCK_FILE"
+if ! flock -n 200 2>/dev/null; then
+    printf "${RED}[!] Another sadp instance is running. Exiting.${RESET}\n"
+    exit 1
+fi
+
+# --- LOGGING (dengan FD terpisah) ---
+mkdir -p "$LOG_DIR" 2>/dev/null
+touch "$LOG_LOCK_FILE"
+chown root:root "$LOG_LOCK_FILE" 2>/dev/null || true
+chmod 0600 "$LOG_LOCK_FILE" 2>/dev/null || true
+exec 201>"$LOG_LOCK_FILE"
+
+log() {
+    local msg="$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    {
+        flock -x 201
+        if [ -f "$LOG_FILE" ]; then
+            size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+            if [ "$size" -gt 5242880 ]; then
+                mv "$LOG_FILE" "$LOG_FILE.old"
+            fi
+        fi
+        echo "$msg" >> "$LOG_FILE"
+    } 2>/dev/null
+}
+
+# --- DISTRO DETECTION ---
+if [ -f /etc/os-release ]; then
+    DISTRO=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    ID=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    VERSION_ID=$(grep "^VERSION_ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
+else
+    DISTRO="Unknown Linux"; ID="unknown"; VERSION_ID=""
+fi
+
+# --- PACKAGE MANAGER DETECTION ---
+detect_pm() {
+    # Default verify function
+    VERIFY_FUNC() { return 1; }
+
+    if command -v xbps-install >/dev/null 2>&1; then
+        PM="XBPS"; INST_CMD=(xbps-install -Sy); REM_CMD=(xbps-remove -R); UPD_CMD=(xbps-install -Su)
+        SYNC_CMD=(xbps-install -S); SRC_CMD=(xbps-query -Rs); CLEAN_CMD=(xbps-remove -O)
+        VERIFY_FUNC() { xbps-query -p pkgver "$1" >/dev/null 2>&1; }
+    elif command -v pacman >/dev/null 2>&1; then
+        PM="PACMAN"; INST_CMD=(pacman -Syu); REM_CMD=(pacman -R); UPD_CMD=(pacman -Syu)
+        SYNC_CMD=(pacman -Sy); SRC_CMD=(pacman -Ss); CLEAN_CMD=(pacman -Sc)
+        VERIFY_FUNC() { pacman -Q "$1" &>/dev/null; }
+    elif command -v apt-get >/dev/null 2>&1; then
+        PM="APT"; INST_CMD=(apt-get install -y); REM_CMD=(apt-get purge -y); UPD_CMD=(apt-get full-upgrade -y)
+        SYNC_CMD=(apt-get update); SRC_CMD=(apt-cache search)
+        CLEAN_CMD_AUTOREMOVE=(apt-get autoremove -y)
+        CLEAN_CMD_CLEAN=(apt-get clean)
+        VERIFY_FUNC() { dpkg -l "$1" 2>/dev/null | grep -q '^ii'; }
+    elif command -v dnf >/dev/null 2>&1; then
+        PM="DNF"; INST_CMD=(dnf install -y); REM_CMD=(dnf remove -y); UPD_CMD=(dnf upgrade -y)
+        SYNC_CMD=(dnf check-update); SRC_CMD=(dnf search); CLEAN_CMD=(dnf autoremove -y)
+        VERIFY_FUNC() { dnf list installed "$1" &>/dev/null; }
+    elif command -v zypper >/dev/null 2>&1; then
+        PM="ZYPPER"; INST_CMD=(zypper install -y); REM_CMD=(zypper remove -y); UPD_CMD=(zypper dup -y)
+        SYNC_CMD=(zypper refresh); SRC_CMD=(zypper search); CLEAN_CMD=(zypper clean)
+        VERIFY_FUNC() { rpm -q "$1" &>/dev/null; }
+    elif command -v slackpkg >/dev/null 2>&1; then
+        PM="SLACKPKG"; INST_CMD=(slackpkg -batch=on install); REM_CMD=(slackpkg -batch=on remove)
+        UPD_CMD=(slackpkg -batch=on upgrade-all); SYNC_CMD=(slackpkg -batch=on update)
+        SRC_CMD=(slackpkg search); CLEAN_CMD=(slackpkg -batch=on clean-system)
+        VERIFY_FUNC() { ls /var/log/packages/ | grep -q "^$1-"; }
+    elif command -v emerge >/dev/null 2>&1; then
+        PM="EMERGE"; INST_CMD=(emerge --ask=n --quiet-build=y); REM_CMD=(emerge --ask=n --quiet-build=y --unmerge)
+        UPD_CMD=(emerge --ask=n --quiet-build=y --update --deep --newuse @world)
+        SYNC_CMD=(emerge --sync); CLEAN_CMD=(emerge --ask=n --depclean)
+        if command -v eix >/dev/null 2>&1; then SRC_CMD=(eix); else SRC_CMD=(emerge --search); fi
+        VERIFY_FUNC() {
+            equery list "$1" &>/dev/null && return 0
+            for d in /var/db/pkg/*/"$1"*; do
+                [ -d "$d" ] && return 0
+            done
+            return 1
+        }
+    elif command -v eopkg >/dev/null 2>&1; then
+        PM="EOPKG"; INST_CMD=(eopkg install -y); REM_CMD=(eopkg remove -y); UPD_CMD=(eopkg upgrade -y)
+        SYNC_CMD=(eopkg update-repo); SRC_CMD=(eopkg search); CLEAN_CMD=(eopkg autoremove -y)
+        VERIFY_FUNC() { eopkg info "$1" &>/dev/null; }
+    elif command -v apk >/dev/null 2>&1; then
+        PM="APK"; INST_CMD=(apk add); REM_CMD=(apk del); UPD_CMD=(apk upgrade); SYNC_CMD=(apk update)
+        SRC_CMD=(apk search); CLEAN_CMD=(apk cache clean)
+        VERIFY_FUNC() { apk info -e "$1" &>/dev/null; }
+    elif command -v nix >/dev/null 2>&1; then
+        PM="NIX"; INST_CMD=(nix-env -iA nixpkgs); REM_CMD=(nix-env -e)
+        UPD_CMD=(nix-env -u); SYNC_CMD=(nix-channel --update); SRC_CMD=(nix search nixpkgs); CLEAN_CMD=(nix-collect-garbage -d)
+        VERIFY_FUNC() { nix-env -q 2>/dev/null | grep -q "^$1"; }
+    elif command -v guix >/dev/null 2>&1; then
+        PM="GUIX"; INST_CMD=(guix install); REM_CMD=(guix remove)
+        UPD_CMD=(guix upgrade); SYNC_CMD=(guix pull); SRC_CMD=(guix search); CLEAN_CMD=(guix gc)
+        VERIFY_FUNC() { guix package -I 2>/dev/null | grep -q "^$1"; }
+    elif command -v snap >/dev/null 2>&1; then
+        PM="SNAP"; INST_CMD=(snap install); REM_CMD=(snap remove); UPD_CMD=(snap refresh)
+        SYNC_CMD=(snap refresh); SRC_CMD=(snap search); CLEAN_CMD=()
+        VERIFY_FUNC() { snap list 2>/dev/null | grep -q "^$1 "; }
+    elif command -v brew >/dev/null 2>&1; then
+        PM="HOMEBREW"; INST_CMD=(brew install); REM_CMD=(brew uninstall); UPD_CMD=(brew upgrade)
+        SYNC_CMD=(brew update); SRC_CMD=(brew search); CLEAN_CMD=(brew cleanup)
+        VERIFY_FUNC() { brew list | grep -q "^$1$"; }
+    else
+        PM="NONE"
+    fi
+}
+detect_pm
+
+# --- HELP ---
+show_help() {
+    printf "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗\n"
+    printf "║          >>>  SADAPTIVE SYSTEM ENGINE v1.0  <<<          ║\n"
+    printf "╚══════════════════════════════════════════════════════════╝\n${RESET}"
+    printf "  ${BOLD}SYSTEM INFO:${RESET}\n"
+    printf "    Distro : ${GREEN}$DISTRO${RESET}\n"
+    printf "    Engine : ${GREEN}${PM:-None (using universal)}${RESET}\n\n"
+    printf "  ${BOLD}COMMANDS:${RESET}\n"
+    printf "    ${YELLOW}sadp install <pkg1> [pkg2]${RESET} : Smart multi-install\n"
+    printf "    ${YELLOW}sadp remove <pkg1> [pkg2]${RESET}  : Smart multi-removal (requires confirmation)\n"
+    printf "    ${YELLOW}sadp update${RESET}                : Full system upgrade\n"
+    printf "    ${YELLOW}sadp search <pkg>${RESET}          : Deep search (native + flatpak + snap + nix)\n"
+    printf "    ${YELLOW}sadp cleanup [--dry-run]${RESET}   : Remove orphans (requires confirmation, low priority)\n"
+    printf "    ${YELLOW}sadp --yes <command>${RESET}       : Auto-accept all confirmations\n"
+    printf "    ${YELLOW}sadp --dry-run <command>${RESET}   : Show what would be done\n"
+    printf "${CYAN}$LINE${RESET}\n"
+    exit 0
+}
+
+# --- HEALTH CHECK ---
+health_check() {
+    printf "${CYAN}${BOLD}[*] Health Check:${RESET}\n"
+    if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -t 3 1.1.1.1 >/dev/null 2>&1; then
+        printf "  ${GREEN}[✔] Internet: OK${RESET}\n"
+    else
+        printf "  ${RED}[✘] Internet: Not reachable.${RESET}\n"
+        return 1
+    fi
+    local free_space=$(df / | awk 'NR==2 {print $4}')
+    local free_mb=$((free_space / 1024))
+    if [ "$free_mb" -lt 500 ]; then
+        printf "  ${RED}[✘] Disk space: Only ${free_mb}MB free on / (need 500MB).${RESET}\n"
+        return 1
+    else
+        printf "  ${GREEN}[✔] Disk space: ${free_mb}MB free on /${RESET}\n"
+    fi
+    return 0
+}
+
+# --- SAFE COMMAND EXECUTION ---
+# Usage: run_cmd "Description" step total mode cmd1 cmd2 ...
+run_cmd() {
+    local desc="$1"
+    local step_num="$2"
+    local total_steps="$3"
+    local mode="$4"
+    shift 4
+    local cmd_arr=("$@")
+
+    printf "${YELLOW}[$step_num/$total_steps] $desc ...${RESET}\n"
+
+    # Throttling hanya untuk mode cleanup
+    local final_cmd=("${cmd_arr[@]}")
+    if [ "$mode" = "cleanup" ]; then
+        final_cmd=("${IONICE_CMD[@]}" "${NICE_CMD[@]}" "${cmd_arr[@]}")
+    fi
+
+    if [ $DRY_RUN -eq 1 ]; then
+        echo "[DRY RUN] Would run: ${final_cmd[*]}"
+        return 0
+    fi
+
+    "${final_cmd[@]}"
+    local ec=$?
+
+    if [ $ec -eq 0 ]; then
+        printf "${GREEN}Done.${RESET}\n"
+    else
+        printf "${RED}Failed (exit code $ec).${RESET}\n"
+    fi
+    log "[$step_num/$total_steps] $desc → exit $ec"
+    return $ec
+}
+
+# --- SANITIZE PACKAGE NAME ---
+sanitize_pkg() {
+    local pkg="${1//[^a-zA-Z0-9_.+-]/}"
+    [ -z "$pkg" ] && return 1
+    echo "$pkg"
+}
+
+# --- VALIDATE PACKAGE NAME ---
+validate_pkg() {
+    local pkg="$1"
+    [ -z "$pkg" ] && return 1
+    [ "${#pkg}" -gt 128 ] && return 1
+    return 0
+}
+
+# --- CHECK IF PACKAGE IS INSTALLED (native only) with diagnostic logging ---
+is_native_installed() {
+    local pkg="$1"
+    if [ "$PM" != "NONE" ]; then
+        if VERIFY_FUNC "$pkg"; then
+            return 0
+        else
+            log "VERIFY: $pkg not found by $PM"
+            local verif_out
+            verif_out=$(VERIFY_FUNC "$pkg" 2>&1)
+            [ -n "$verif_out" ] && log "VERIFY DEBUG: $verif_out"
+            return 1
+        fi
+    fi
+    return 1
+}
+
+# --- CHECK FLATPAK INSTALLED (cek sistem dan user) ---
+is_flatpak_installed() {
+    local pkg="$1"
+    if command -v flatpak >/dev/null 2>&1; then
+        # Cek flatpak sistem
+        flatpak list --app --columns=application 2>/dev/null | grep -qi "$pkg" && return 0
+        # Cek flatpak user
+        flatpak list --app --user --columns=application 2>/dev/null | grep -qi "$pkg" && return 0
+    fi
+    return 1
+}
+
+# --- FLATPAK CANDIDATES (safe, using while loop) ---
+get_flatpak_candidates() {
+    flatpak search "$1" --columns=application 2>/dev/null | grep -v "Application"
+}
+
+# --- INSTALL (dengan flatpak user context) ---
+do_install() {
+    if ! health_check; then
+        printf "${RED}Health check failed. Aborting.${RESET}\n"
+        return 1
+    fi
+
+    # Tangkap user asli jika dijalankan via sudo
+    local real_user="${SUDO_USER:-$USER}"
+
+    for PKG in "$@"; do
+        PKG=$(sanitize_pkg "$PKG") || {
+            printf "${RED}Invalid package name. Skipping.${RESET}\n"
+            continue
+        }
+        validate_pkg "$PKG" || {
+            printf "${RED}Package name too long or empty. Skipping.${RESET}\n"
+            continue
+        }
+
+        log "Installing $PKG"
+        printf "\n${BLUE}${BOLD}[*] ANALYZING: $PKG${RESET}\n"
+
+        # Step 1: Native install
+        if [ "$PM" != "NONE" ]; then
+            if is_native_installed "$PKG"; then
+                printf "${GREEN}[✓] $PKG is already installed natively. Skipping native.${RESET}\n"
+                continue
+            else
+                if run_cmd "Native install" 1 3 normal "${INST_CMD[@]}" "$PKG"; then
+                    if is_native_installed "$PKG"; then
+                        log "Installed $PKG natively"
+                        continue
+                    fi
+                fi
+            fi
+        fi
+
+        # Step 2: Flatpak (dengan user context)
+        if command -v flatpak >/dev/null 2>&1; then
+            cand_array=()
+            while IFS= read -r flat_id; do
+                cand_array+=("$flat_id")
+            done < <(get_flatpak_candidates "$PKG")
+            if [ ${#cand_array[@]} -gt 0 ]; then
+                # Batasi jumlah kandidat agar tidak membanjiri terminal
+                if [ ${#cand_array[@]} -gt 20 ]; then
+                    printf "${YELLOW}Too many candidates (${#cand_array[@]}), showing first 20. Use exact ID to search.${RESET}\n"
+                    cand_array=("${cand_array[@]:0:20}")
+                fi
+
+                if [ ${#cand_array[@]} -eq 1 ]; then
+                    flat_id="${cand_array[0]}"
+                    printf "${YELLOW}[!] Found Flatpak candidate: $flat_id${RESET}\n"
+                    if [ $AUTO_YES -eq 1 ]; then
+                        choice=1
+                    else
+                        if [ -t 0 ]; then
+                            printf "Install this candidate? (y/N) "
+                            read -t 10 -r ans || ans="n"
+                        else
+                            ans="n"
+                        fi
+                        [[ "$ans" =~ ^[Yy]$ ]] && choice=1 || choice=0
+                    fi
+                    if [ "$choice" -eq 1 ]; then
+                        # Instalasi flatpak sebagai user biasa
+                        if [ "$EUID" -eq 0 ] && [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
+                            run_cmd "Flatpak install ($flat_id) as $real_user" 2 3 normal sudo -u "$real_user" flatpak install --user -y flathub "$flat_id"
+                        else
+                            run_cmd "Flatpak install ($flat_id)" 2 3 normal flatpak install --user -y flathub "$flat_id"
+                        fi
+                        if is_flatpak_installed "$flat_id"; then
+                            log "Installed $PKG via flatpak (ID: $flat_id)"
+                            continue
+                        fi
+                    fi
+                else
+                    printf "${YELLOW}Multiple Flatpak candidates found:${RESET}\n"
+                    local i=1
+                    for cand in "${cand_array[@]}"; do
+                        printf "  $i) $cand\n"
+                        ((i++))
+                    done
+                    if [ $AUTO_YES -eq 1 ]; then
+                        printf "Auto-selecting first candidate (--yes).\n"
+                        choice=1
+                    else
+                        if [ -t 0 ]; then
+                            printf "Choose candidate number (or 0 to skip): "
+                            read -t 10 -r choice || choice=0
+                        else
+                            choice=0
+                        fi
+                    fi
+                    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#cand_array[@]} ]; then
+                        flat_id="${cand_array[$((choice-1))]}"
+                        if [ "$EUID" -eq 0 ] && [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
+                            run_cmd "Flatpak install ($flat_id) as $real_user" 2 3 normal sudo -u "$real_user" flatpak install --user -y flathub "$flat_id"
+                        else
+                            run_cmd "Flatpak install ($flat_id)" 2 3 normal flatpak install --user -y flathub "$flat_id"
+                        fi
+                        if is_flatpak_installed "$flat_id"; then
+                            log "Installed $PKG via flatpak (ID: $flat_id)"
+                            continue
+                        fi
+                    else
+                        printf "Skipping flatpak.\n"
+                    fi
+                fi
+            fi
+        fi
+
+        # Step 3: Suggest search
+        printf "${RED}${BOLD}[!] NOT FOUND: $PKG${RESET}\n"
+        printf "Try 'sadp search $PKG' for alternatives.\n"
+        log "Failed to install $PKG"
+    done
+}
+
+# --- REMOVE (with confirmation) ---
+do_remove() {
+    for PKG in "$@"; do
+        PKG=$(sanitize_pkg "$PKG") || {
+            printf "${RED}Invalid package name. Skipping.${RESET}\n"
+            continue
+        }
+        log "Removing $PKG"
+        printf "${YELLOW}[*] Removing: $PKG...${RESET}\n"
+
+        if [ $AUTO_YES -eq 0 ]; then
+            if [ -t 0 ]; then
+                printf "Are you sure you want to remove $PKG? (y/N) "
+                read -t 10 -r ans || ans="n"
+            else
+                ans="n"
+            fi
+            [[ ! "$ans" =~ ^[Yy]$ ]] && { printf "Skipped.\n"; continue; }
+        fi
+
+        if [ "$PM" != "NONE" ]; then
+            if run_cmd "Native removal" 1 2 normal "${REM_CMD[@]}" "$PKG"; then
+                log "Removed $PKG natively"
+            else
+                printf "${RED}Native removal failed.${RESET}\n"
+            fi
+        fi
+
+        if command -v flatpak >/dev/null 2>&1; then
+            flatpak uninstall -y "$PKG" 2>/dev/null && printf "${GREEN}[+] Flatpak removed.${RESET}\n"
+        fi
+        if command -v snap >/dev/null 2>&1; then
+            snap remove "$PKG" 2>/dev/null && printf "${GREEN}[+] Snap removed.${RESET}\n"
+        fi
+    done
+}
+
+# --- UPDATE ---
+do_update() {
+    if ! health_check; then
+        printf "${RED}Health check failed. Aborting.${RESET}\n"
+        return 1
+    fi
+    log "System update started"
+    printf "${BLUE}${BOLD}[*] FULL SYSTEM UPGRADE...${RESET}\n"
+    if [ "$PM" != "NONE" ]; then
+        run_cmd "System upgrade (sync)" 1 2 normal "${SYNC_CMD[@]}" && run_cmd "System upgrade (apply)" 1 2 normal "${UPD_CMD[@]}"
+    else
+        printf "${YELLOW}[1/2] No native PM, skipping system upgrade.${RESET}\n"
+    fi
+    if command -v flatpak >/dev/null 2>&1; then
+        if [ $AUTO_YES -eq 1 ]; then
+            run_cmd "Flatpak updates" 2 2 normal flatpak update -y
+        else
+            if [ -t 0 ]; then
+                printf "${YELLOW}Update flatpaks? (y/N) ${RESET}"
+                read -t 10 -r ans || ans="n"
+            else
+                ans="n"
+            fi
+            [[ "$ans" =~ ^[Yy]$ ]] && run_cmd "Flatpak updates" 2 2 normal flatpak update -y
+        fi
+    fi
+    printf "\n${GREEN}${BOLD}[+] Update finished.${RESET}\n"
+    log "System update finished"
+}
+
+# --- CLEANUP ---
+do_cleanup() {
+    printf "${CYAN}${BOLD}[*] CLEANING SYSTEM JUNK...${RESET}\n"
+    if [ $AUTO_YES -eq 0 ]; then
+        printf "${YELLOW}This will remove orphan packages and clean cache.${RESET}\n"
+        if [ -t 0 ]; then
+            printf "Continue? (y/N) "
+            read -t 10 -r ans || ans="n"
+        else
+            ans="n"
+        fi
+        [[ ! "$ans" =~ ^[Yy]$ ]] && { echo "Aborted."; return 1; }
+    fi
+
+    if [ "$PM" != "NONE" ]; then
+        case "$PM" in
+            XBPS)
+                run_cmd "Cleanup (xbps-remove -O)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+            PACMAN)
+                run_cmd "Cleanup (pacman -Sc)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+            APT)
+                run_cmd "Cleanup (apt autoremove)" 1 2 cleanup "${CLEAN_CMD_AUTOREMOVE[@]}"
+                run_cmd "Cleanup (apt clean)" 2 2 cleanup "${CLEAN_CMD_CLEAN[@]}"
+                ;;
+            DNF)
+                run_cmd "Cleanup (dnf autoremove)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+            ZYPPER)
+                run_cmd "Cleanup (zypper clean)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+            SLACKPKG)
+                run_cmd "Cleanup (slackpkg clean-system)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+            EMERGE)
+                run_cmd "Cleanup (emerge --depclean)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+            NIX)
+                run_cmd "Cleanup (nix-collect-garbage)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+            GUIX)
+                run_cmd "Cleanup (guix gc)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+            SNAP)
+                echo "Snap cleanup not performed (potentially unsafe)."
+                ;;
+            HOMEBREW)
+                run_cmd "Cleanup (brew cleanup)" 1 1 cleanup "${CLEAN_CMD[@]}"
+                ;;
+        esac
+    fi
+
+    if command -v flatpak >/dev/null 2>&1; then
+        if [ -t 0 ]; then
+            printf "${YELLOW}Clean flatpak unused runtimes? (y/N) ${RESET}"
+            read -t 10 -r ans || ans="n"
+        else
+            ans="n"
+        fi
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            run_cmd "Flatpak cleanup" 1 1 cleanup flatpak uninstall --unused -y
+        fi
+    fi
+
+    printf "${GREEN}[+] Cleanup finished.${RESET}\n"
+    log "Cleanup finished"
+}
+
+# --- SEARCH ---
+do_search() {
+    local PKG="$1"
+    if [ -z "$PKG" ]; then
+        printf "${RED}Search term required.${RESET}\n"
+        return 1
+    fi
+    PKG=$(sanitize_pkg "$PKG") || {
+        printf "${RED}Invalid search term.${RESET}\n"
+        return 1
+    }
+    printf "${CYAN}${BOLD}[*] SEARCHING: $PKG${RESET}\n"
+    printf "--- Native (${PM:-none}) ---\n"
+    if [ "$PM" != "NONE" ]; then
+        "${SRC_CMD[@]}" "$PKG"
+    else
+        echo "No native package manager detected."
+    fi
+    if command -v flatpak >/dev/null 2>&1; then
+        printf "\n--- Flatpak (Flathub) ---\n"
+        flatpak search --columns=name,application,description "$PKG" 2>/dev/null | head -n 10
+    fi
+    if command -v snap >/dev/null 2>&1; then
+        printf "\n--- Snap ---\n"
+        snap search "$PKG" | head -n 10
+    fi
+    if command -v nix >/dev/null 2>&1; then
+        printf "\n--- Nixpkgs ---\n"
+        nix search nixpkgs "$PKG" | head -n 10
+    fi
+}
+
+# --- TRAP (tidak menghapus lock paksa) ---
+cleanup_on_exit() {
+    if [ -f /var/lib/pacman/db.lck ]; then
+        printf "\n${YELLOW}[!] Pacman lock file detected. If no other pacman is running, you may need to remove it manually.${RESET}\n"
+    fi
+    printf "\n${RED}[!] Interrupted. Exiting cleanly.${RESET}\n"
+    exit 1
+}
+trap cleanup_on_exit INT TERM
+
+# --- PARSE GLOBAL OPTIONS ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --yes|-y) AUTO_YES=1; shift ;;
+        *) break ;;
+    esac
+done
+
+# --- MAIN ---
+case "$1" in
+    install) shift; do_install "$@" ;;
+    remove|uninstall) shift; do_remove "$@" ;;
+    update|upgrade) do_update ;;
+    search) shift; do_search "$1" ;;
+    cleanup) do_cleanup ;;
+    help|--help|-h) show_help ;;
+    *) show_help ;;
+esac
