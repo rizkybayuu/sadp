@@ -156,7 +156,7 @@ detect_pm
 # --- HELP ---
 show_help() {
     printf "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗\n"
-    printf "║          >>>  SADAPTIVE SYSTEM ENGINE v1.0  <<<          ║\n"
+    printf "║         >>>  SADAPTIVE PACKAGE MANAGER v1.0  <<<         ║\n"
     printf "╚══════════════════════════════════════════════════════════╝\n${RESET}"
     printf "  ${BOLD}SYSTEM INFO:${RESET}\n"
     printf "    Distro : ${GREEN}$DISTRO${RESET}\n"
